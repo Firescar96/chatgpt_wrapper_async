@@ -1,6 +1,7 @@
 import argparse
 import base64
 import cmd
+import asyncio
 import json
 import operator
 import platform
@@ -16,7 +17,7 @@ if is_windows:
 else:
     import readline
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -34,33 +35,38 @@ class ChatGPT:
     eof_div_id = "chatgpt-wrapper-conversation-stream-data-eof"
     session_div_id = "chatgpt-wrapper-session-data"
 
-    def __init__(self, headless: bool = True, browser = "firefox"):
-        self.play = sync_playwright().start()
+    def __init__(self, headless:bool = True):
+        self.headless = headless
+        self.play = None
+        self.browser = None
+        self.page = None
+        self.parent_message_id = str(uuid.uuid4())
+        self.conversation_id = None
+        self.session = None
+    
+    async def async_init(self, browser = "firefox"):
+        self.play = await async_playwright().start()
 
         try:
             playbrowser = getattr(self.play, browser)
         except Exception:
             print(f"Browser {browser} is invalid, falling back on firefox")
             playbrowser = self.play.firefox
-
-        self.browser = playbrowser.launch_persistent_context(
+        self.browser = await playbrowser.launch_persistent_context(
             user_data_dir="/tmp/playwright",
-            headless=headless,
+            headless=self.headless,
         )
         if len(self.browser.pages) > 0:
             self.page = self.browser.pages[0]
         else:
             self.page = self.browser.new_page()
-        self._start_browser()
-        self.parent_message_id = str(uuid.uuid4())
-        self.conversation_id = None
-        self.session = None
+        await self._start_browser()
 
-    def _start_browser(self):
-        self.page.goto("https://chat.openai.com/")
+    async def _start_browser(self):
+        await self.page.goto("https://chat.openai.com/")
 
-    def refresh_session(self):
-        self.page.evaluate(
+    async def refresh_session(self):
+        await self.page.evaluate(
             """
         const xhr = new XMLHttpRequest();
         xhr.open('GET', 'https://chat.openai.com/api/auth/session');
@@ -79,23 +85,23 @@ class ChatGPT:
         )
 
         while True:
-            session_datas = self.page.query_selector_all(f"div#{self.session_div_id}")
+            session_datas = await self.page.query_selector_all(f"div#{self.session_div_id}")
             if len(session_datas) > 0:
                 break
             sleep(0.2)
 
-        session_data = json.loads(session_datas[0].inner_text())
+        session_data = json.loads(await session_datas[0].inner_text())
         self.session = session_data
 
-        self.page.evaluate(f"document.getElementById('{self.session_div_id}').remove()")
+        await self.page.evaluate(f"document.getElementById('{self.session_div_id}').remove()")
 
-    def _cleanup_divs(self):
-        self.page.evaluate(f"document.getElementById('{self.stream_div_id}').remove()")
-        self.page.evaluate(f"document.getElementById('{self.eof_div_id}').remove()")
+    async def _cleanup_divs(self):
+        await self.page.evaluate(f"document.getElementById('{self.stream_div_id}').remove()")
+        await self.page.evaluate(f"document.getElementById('{self.eof_div_id}').remove()")
 
-    def ask_stream(self, prompt: str):
+    async def ask_stream(self, prompt: str):
         if self.session is None:
-            self.refresh_session()
+            await self.refresh_session()
 
         new_message_id = str(uuid.uuid4())
 
@@ -173,13 +179,13 @@ class ChatGPT:
             .replace("EOF_DIV_ID", self.eof_div_id)
         )
 
-        self.page.evaluate(code)
+        await self.page.evaluate(code)
 
         last_event_msg = ""
         while True:
-            eof_datas = self.page.query_selector_all(f"div#{self.eof_div_id}")
+            eof_datas = await self.page.query_selector_all(f"div#{self.eof_div_id}")
 
-            conversation_datas = self.page.query_selector_all(
+            conversation_datas = await self.page.query_selector_all(
                 f"div#{self.stream_div_id}"
             )
             if len(conversation_datas) == 0:
@@ -188,7 +194,7 @@ class ChatGPT:
             full_event_message = None
 
             try:
-                event_raw = base64.b64decode(conversation_datas[0].inner_html())
+                event_raw = base64.b64decode(await conversation_datas[0].inner_html())
                 if len(event_raw) > 0:
                     event = json.loads(event_raw)
                     if event is not None:
@@ -218,9 +224,9 @@ class ChatGPT:
 
             sleep(0.2)
 
-        self._cleanup_divs()
+        await self._cleanup_divs()
 
-    def ask(self, message: str) -> str:
+    async def ask(self, message: str) -> str:
         """
         Send a message to chatGPT and return the response.
 
@@ -230,7 +236,7 @@ class ChatGPT:
         Returns:
             str: The response received from OpenAI.
         """
-        response = list(self.ask_stream(message))
+        response = list([x async for x in self.ask_stream(message)])
         return (
             reduce(operator.add, response)
             if len(response) > 0
@@ -257,6 +263,10 @@ class GPTShell(cmd.Cmd):
     message_map = {}
     stream = False
     logfile = None
+
+    def __init__(self, loop):
+        super().__init__()
+        self.loop = loop
 
     def _set_args(self, args):
         self.stream = args.stream
@@ -354,7 +364,7 @@ class GPTShell(cmd.Cmd):
         if self.stream:
             response = ""
             first = True
-            for chunk in self.chatgpt.ask_stream(line):
+            for chunk in self.loop.run_until_complete(self.chatgpt.ask_stream(line)):
                 if first:
                     print("")
                     first = False
@@ -363,16 +373,16 @@ class GPTShell(cmd.Cmd):
                 response += chunk
             print("\n")
         else:
-            response = self.chatgpt.ask(line)
+            response = self.loop.run_until_complete(self.chatgpt.ask(line))
             print("")
             self._print_markdown(response)
 
         self._write_log(line, response)
         self._update_message_map()
 
-    def do_session(self, _):
+    async def do_session(self, _):
         "`session` refreshes your session information.  This can resolve errors under certain scenarios."
-        self.chatgpt.refresh_session()
+        await self.chatgpt.refresh_session()
         usable = (
             "The session appears to be usable."
             if "accessToken" in self.chatgpt.session
@@ -482,9 +492,11 @@ def main():
         )
 
     extra_kwargs = {} if args.browser is None else {"browser": args.browser}
+    loop = asyncio.new_event_loop()
     chatgpt = ChatGPT(headless=not install_mode, **extra_kwargs)
+    loop.run_until_complete(chatgpt.async_init())
 
-    shell = GPTShell()
+    shell = GPTShell(loop)
     shell._set_chatgpt(chatgpt)
     shell._set_args(args)
 
